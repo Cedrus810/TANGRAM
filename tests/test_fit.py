@@ -4,6 +4,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 import torch
+from conftest import aa_index_of
 
 from socg.data import CGDataset, CGTrajectory
 from socg.dynamics import CGSimulator, LangevinConfig
@@ -20,7 +21,7 @@ def _toy_dataset(toy_topology, toy_coords, model_for_forces, seed=0):
     R = torch.as_tensor(toy_coords.astype(np.float64))
     s = torch.as_tensor(states, dtype=torch.long)
     with torch.no_grad():
-        F = model_for_forces.forces(R, s).numpy().astype(np.float32)
+        F = model_for_forces.forces(R, s, aa_index_of(toy_topology)).numpy().astype(np.float32)
     trj = CGTrajectory(coords=toy_coords, forces=F, states=states, dt_ps=1.0)
     return CGDataset(topology=toy_topology, temperature=300.0, trajectories=[trj])
 
@@ -34,7 +35,7 @@ def test_pl_uniform_states_converges_to_ln3(toy_topology, toy_coords, toy_model)
     R = torch.as_tensor(toy_coords.astype(np.float64))
     s = torch.as_tensor(states, dtype=torch.long)
     with torch.no_grad():
-        F = toy_model.forces(R, s).numpy().astype(np.float32)  # 先验力，与 s 无关
+        F = toy_model.forces(R, s, aa_index_of(toy_topology)).numpy().astype(np.float32)  # 先验力，与 s 无关
     half = toy_coords.shape[0] // 2
 
     def ds(sl):
@@ -50,7 +51,8 @@ def test_pl_uniform_states_converges_to_ln3(toy_topology, toy_coords, toy_model)
     Rv = torch.as_tensor(coords.astype(np.float64))
     sv = torch.as_tensor(states_h, dtype=torch.long)
     with torch.no_grad():
-        pl = float(pseudo_likelihood_nll(model, Rv, sv, 1.0 / (0.0083144626181532 * 300.0)))
+        pl = float(pseudo_likelihood_nll(model, Rv, sv, aa_index_of(toy_topology),
+                                     1.0 / (0.0083144626181532 * 300.0)))
     assert pl == pytest.approx(np.log(3), abs=0.02)
 
 
@@ -59,12 +61,13 @@ def test_k1_pl_is_zero_and_no_grad_to_eps_wnn(toy_topology, toy_coords, toy_mode
     rng = np.random.default_rng(1)
     R = torch.as_tensor(toy_coords[:16].astype(np.float64))
     s = torch.as_tensor(rng.integers(0, 3, size=(16, 6)), dtype=torch.long)
-    pl = pseudo_likelihood_nll(model, R, s, 1.0 / 2.4943)
+    pl = pseudo_likelihood_nll(model, R, s, aa_index_of(model), 1.0 / 2.4943)
     assert float(pl) == 0.0
     assert not pl.requires_grad                     # PL 不连接任何参数
     # 总损失（FM + PL）对 eps、w_nn 的梯度为空或恒 0：K=1 时它们只是常数能量偏移
     F_ref = torch.zeros_like(R)
-    loss = force_matching_loss(model, R, s, F_ref, torch.tensor(1.0, dtype=R.dtype)) + pl
+    loss = force_matching_loss(model, R, s, aa_index_of(model), F_ref,
+                               torch.tensor(1.0, dtype=R.dtype)) + pl
     grads = torch.autograd.grad(loss, [model.eps, model.w_nn], allow_unused=True)
     for g in grads:
         assert g is None or float(g.abs().max()) == 0.0
@@ -83,8 +86,9 @@ def test_frozen_sites_excluded_from_pl(toy_model_double):
     s2 = s1.clone()
     s2[:, 0] = (s1[:, 0] + 1) % 3      # 冻结位点 0 换标签
     s2[:, 5] = (s1[:, 5] + 2) % 3      # 冻结位点 5 换标签
-    pl1 = pseudo_likelihood_nll(model, R, s1, beta)
-    pl2 = pseudo_likelihood_nll(model, R, s2, beta)
+    a = aa_index_of(model)
+    pl1 = pseudo_likelihood_nll(model, R, s1, a, beta)
+    pl2 = pseudo_likelihood_nll(model, R, s2, a, beta)
     assert float(pl1) == pytest.approx(float(pl2), rel=1e-12)
 
 
@@ -97,7 +101,7 @@ def test_pl_gradient_flows(toy_model_double):
     rng = np.random.default_rng(5)
     R = torch.as_tensor(rng.normal(0, 0.4, size=(8, 6, 3)))
     s = torch.as_tensor(rng.integers(0, 3, size=(8, 6)), dtype=torch.long)
-    pl = pseudo_likelihood_nll(model, R, s, 1.0 / 2.4943)
+    pl = pseudo_likelihood_nll(model, R, s, aa_index_of(model), 1.0 / 2.4943)
     g = torch.autograd.grad(pl, model.w_pair_state)[0]
     assert torch.isfinite(g).all() and float(g.abs().sum()) > 0
 
@@ -122,7 +126,8 @@ def test_teacher_student_self_consistency(toy_topology, toy_priors):
     s0 = rng.integers(0, 3, size=(32, 6))
     cfg = LangevinConfig(temperature=300.0, dt_ps=0.002, friction_per_ps=5.0,
                          flip_interval=10, record_interval=1, seed=11)
-    sim = CGSimulator(teacher, cfg, torch.as_tensor(R0), torch.as_tensor(s0, dtype=torch.long))
+    sim = CGSimulator(teacher, cfg, torch.as_tensor(R0), torch.as_tensor(s0, dtype=torch.long),
+                      aa_index_of(teacher))
     coords, states = sim.run(800)
     coords = coords.reshape(-1, 6, 3).astype(np.float64)
     states = states.reshape(-1, 6).astype(np.int64)
@@ -131,7 +136,7 @@ def test_teacher_student_self_consistency(toy_topology, toy_priors):
     R_all = torch.as_tensor(coords)
     s_all = torch.as_tensor(states, dtype=torch.long)
     with torch.no_grad():
-        F_true = teacher.forces(R_all, s_all).numpy()
+        F_true = teacher.forces(R_all, s_all, aa_index_of(teacher)).numpy()
     noise_std = 0.5 * F_true.std()
     rng = np.random.default_rng(1)
     F_noisy = (F_true + rng.normal(0, noise_std, F_true.shape)).astype(np.float32)
@@ -153,16 +158,17 @@ def test_teacher_student_self_consistency(toy_topology, toy_priors):
     R_h = torch.as_tensor(coords[hold])
     s_h = torch.as_tensor(states[hold], dtype=torch.long)
     with torch.no_grad():
-        F_s = student.forces(R_h, s_h).numpy()
+        F_s = student.forces(R_h, s_h, aa_index_of(student)).numpy()
     rel_rmse = np.sqrt(np.mean((F_s - F_true[hold]) ** 2)) / np.sqrt(np.mean(F_true[hold] ** 2))
     assert rel_rmse < 0.15
 
     # 条件态分布 TV
     movable = np.where(~toy_topology.frozen_mask)[0]
+    aa_t, aa_s = aa_index_of(teacher), aa_index_of(student)
     with torch.no_grad():
-        U_t = torch.stack([teacher.energy(R_h, _with_state(s_h, i, k))
+        U_t = torch.stack([teacher.energy(R_h, _with_state(s_h, i, k), aa_t)
                            for i in movable for k in range(3)])
-        U_s = torch.stack([student.energy(R_h, _with_state(s_h, i, k))
+        U_s = torch.stack([student.energy(R_h, _with_state(s_h, i, k), aa_s)
                            for i in movable for k in range(3)])
     K = 3
     U_t = U_t.reshape(len(movable), K, -1)          # (site, k, B)
@@ -185,6 +191,7 @@ def test_force_matching_loss_value(toy_model_double):
     s = torch.zeros((4, 6), dtype=torch.long)
     F_ref = torch.zeros_like(R)
     f_var = torch.tensor(1.0)
-    loss = force_matching_loss(model, R, s, F_ref, f_var)
-    expected = float((model.forces(R, s) ** 2).mean())
+    a = aa_index_of(model)
+    loss = force_matching_loss(model, R, s, a, F_ref, f_var)
+    expected = float((model.forces(R, s, a) ** 2).mean())
     assert float(loss) == pytest.approx(expected, rel=1e-6)

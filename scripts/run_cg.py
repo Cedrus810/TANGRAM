@@ -60,6 +60,8 @@ def main() -> int:
     sim = CGSimulator(model.to(device=device), cfg,
                       torch.as_tensor(R0, device=device),
                       torch.as_tensor(s0, device=device),
+                      torch.as_tensor(model.topo.aa_index, dtype=torch.long,
+                                      device=device),
                       on_nonfinite="freeze")
 
     out = Path(args.out)

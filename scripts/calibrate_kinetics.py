@@ -67,6 +67,8 @@ def run_cg(model, pool_coords, pool_states, temperature, batch, steps, record_ev
     sim = CGSimulator(model, cfg,
                       torch.as_tensor(pool_coords[pick].astype(np.float32), device=device),
                       torch.as_tensor(pool_states[pick].astype(np.int64), device=device),
+                      torch.as_tensor(model.topo.aa_index, dtype=torch.long,
+                                      device=device),
                       on_nonfinite="freeze")
     coords, states = sim.run(steps)
     ok = ~sim.exploded_mask

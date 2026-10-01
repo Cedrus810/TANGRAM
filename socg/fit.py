@@ -31,17 +31,19 @@ class FitConfig:
 
 
 def force_matching_loss(model: SOCGModel, R: torch.Tensor, s: torch.Tensor,
-                        F_ref: torch.Tensor, f_var: torch.Tensor) -> torch.Tensor:
-    F_model = model.forces(R, s, create_graph=True)
+                        a: torch.Tensor, F_ref: torch.Tensor,
+                        f_var: torch.Tensor) -> torch.Tensor:
+    F_model = model.forces(R, s, a, create_graph=True)
     return ((F_model - F_ref) ** 2).mean() / f_var
 
 
 def pseudo_likelihood_nll(model: SOCGModel, R: torch.Tensor, s: torch.Tensor,
+                          a: torch.Tensor,
                           beta_: float | torch.Tensor) -> torch.Tensor:
     """态伪似然 NLL（带参数梯度，可反传）。
 
     K=1 时恒为 0（其梯度中不含 eps、w_nn）；冻结位点不参与。
-    PL = −mean over (帧, 可动位点 i) of log softmax_k(−β U(R, s_i:=k))[s_i]
+    PL = −mean over (帧, 可动位点 i) of log softmax_k(−β U(R, s_i:=k, a))[s_i]
     """
     if model.config.n_states == 1:
         return R.sum() * 0.0
@@ -57,13 +59,13 @@ def pseudo_likelihood_nll(model: SOCGModel, R: torch.Tensor, s: torch.Tensor,
         for k in range(K):
             s_k = s_base.clone()
             s_k[:, site] = k
-            U[:, k] = model.energy(R, s_k)
+            U[:, k] = model.energy(R, s_k, a)
         logp = torch.log_softmax(-beta_ * U, dim=-1)
         total = total - logp[rows, s_base[:, site]].sum()
     return total / (R.shape[0] * movable.numel())
 
 
-def _eval_metrics(model, coords, states, forces, f_var, beta_, device,
+def _eval_metrics(model, coords, states, a, forces, f_var, beta_, device,
                   chunk: int = 4096) -> dict:
     model.eval()
     n = coords.shape[0]
@@ -73,9 +75,9 @@ def _eval_metrics(model, coords, states, forces, f_var, beta_, device,
             R = torch.as_tensor(coords[lo:lo + chunk], device=device)
             s = torch.as_tensor(states[lo:lo + chunk], device=device, dtype=torch.long)
             F = torch.as_tensor(forces[lo:lo + chunk], device=device)
-            F_model = model.forces(R, s)
+            F_model = model.forces(R, s, a)
             fm_sum += float(((F_model - F) ** 2).sum()) / float(f_var) / (F.shape[0] * F.shape[1] * 3)
-            pl_sum += float(pseudo_likelihood_nll(model, R, s, beta_)) * R.shape[0]
+            pl_sum += float(pseudo_likelihood_nll(model, R, s, a, beta_)) * R.shape[0]
             r2_res += float(((F_model - F) ** 2).sum())
             r2_tot += float(((F - F.mean(dim=0, keepdim=True)) ** 2).sum())
     model.train()
@@ -97,6 +99,8 @@ def fit(model: SOCGModel, train: CGDataset, val: CGDataset,
     f_var_np = forces_tr.astype(np.float64).var(axis=0).mean()
     f_var = torch.tensor(max(f_var_np, 1e-12), device=device)
     beta_ = 1.0 / (KB * train.temperature)
+    # 运行时序列状态（统一设计文档 §8）：拟合期的 a 来自数据集拓扑的参考序列
+    a = torch.as_tensor(train.topology.aa_index, dtype=torch.long, device=device)
 
     rng = np.random.default_rng(config.seed)
     torch.manual_seed(config.seed)
@@ -112,8 +116,8 @@ def fit(model: SOCGModel, train: CGDataset, val: CGDataset,
         F = torch.as_tensor(forces_tr[idx], device=device)
         s = model.prepare_states(s)
 
-        fm = force_matching_loss(model, R, s, F, f_var)
-        pl = pseudo_likelihood_nll(model, R, s, beta_)
+        fm = force_matching_loss(model, R, s, a, F, f_var)
+        pl = pseudo_likelihood_nll(model, R, s, a, beta_)
         l2 = sum((p ** 2).sum() for p in model.parameters() if p.requires_grad)
         loss = fm + config.pl_weight * pl + config.l2 * l2
 
@@ -122,8 +126,8 @@ def fit(model: SOCGModel, train: CGDataset, val: CGDataset,
         opt.step()
 
         if step % config.eval_every == 0 or step == config.max_steps:
-            tr_m = _eval_metrics(model, coords_tr, states_tr, forces_tr, f_var, beta_, device)
-            va_m = _eval_metrics(model, coords_va, states_va, forces_va, f_var, beta_, device)
+            tr_m = _eval_metrics(model, coords_tr, states_tr, a, forces_tr, f_var, beta_, device)
+            va_m = _eval_metrics(model, coords_va, states_va, a, forces_va, f_var, beta_, device)
             history.append({
                 "step": step,
                 "wall_s": time.time() - start,

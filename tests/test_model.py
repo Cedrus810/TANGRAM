@@ -6,6 +6,7 @@ import copy
 import numpy as np
 import pytest
 import torch
+from conftest import aa_index_of
 
 from socg.model.socg import ModelConfig, SOCGModel, load_model, save_model
 from socg.states import FROZEN_STATE
@@ -24,9 +25,10 @@ def test_forces_match_finite_difference(toy_model_double, toy_coords):
     rng = np.random.default_rng(0)
     R = torch.as_tensor(toy_coords[:2].astype(np.float64))
     s = torch.as_tensor(rng.integers(0, 3, size=(2, 6)), dtype=torch.long)
-    F = model.forces(R, s).detach().numpy()
+    a = aa_index_of(model)
+    F = model.forces(R, s, a).detach().numpy()
 
-    U = lambda r: model.energy(torch.as_tensor(r), s).detach().numpy()
+    U = lambda r: model.energy(torch.as_tensor(r), s, a).detach().numpy()
     h = 1e-6
     for b in range(2):
         for i in range(6):
@@ -51,8 +53,9 @@ def test_rotation_translation_invariance(toy_model_double):
     if np.linalg.det(Q) < 0:
         Q[:, 0] = -Q[:, 0]
     s = torch.as_tensor(rng.integers(0, 3, size=(2, 6)), dtype=torch.long)
-    e1 = model.energy(torch.as_tensor(R), s)
-    e2 = model.energy(torch.as_tensor(R @ Q.T + 10.0), s)
+    a = aa_index_of(model)
+    e1 = model.energy(torch.as_tensor(R), s, a)
+    e2 = model.energy(torch.as_tensor(R @ Q.T + 10.0), s, a)
     assert torch.max(torch.abs(e1 - e2)) < 1e-8
 
 
@@ -64,7 +67,8 @@ def test_energy_depends_on_state_k3(toy_model_double):
     rng = np.random.default_rng(2)
     R = torch.as_tensor(rng.normal(0, 0.4, size=(1, 6, 3)))
     # 位点 1 可动；位点 0 冻结（会被强制归位为 FROZEN_STATE）
-    e = [model.energy(R, torch.as_tensor([[1, k, 2, 0, 1, 1]])).item()
+    a = aa_index_of(model)
+    e = [model.energy(R, torch.as_tensor([[1, k, 2, 0, 1, 1]]), a).item()
          for k in range(3)]
     assert len(set(e)) == 3
 
@@ -79,10 +83,11 @@ def test_k1_insensitive_to_states(toy_model_double):
     rng = np.random.default_rng(3)
     R = torch.as_tensor(rng.normal(0, 0.4, size=(4, 6, 3)))
     s = torch.as_tensor(rng.integers(0, 3, size=(4, 6)), dtype=torch.long)
-    e_ref = model.energy(R, s)
+    a = aa_index_of(model)
+    e_ref = model.energy(R, s, a)
     for k in range(3):
         s2 = torch.full_like(s, k)
-        assert torch.allclose(model.energy(R, s2), e_ref)
+        assert torch.allclose(model.energy(R, s2, a), e_ref)
 
 
 def test_prepare_states_freezes(toy_model):
@@ -109,7 +114,7 @@ def test_prior_guards_rbf_range(toy_model, toy_coords):
     kT300 = 0.0083144626181532 * 300.0
 
     def U(R, m=model):
-        return m.energy(torch.as_tensor(R[None]), s0).item()
+        return m.energy(torch.as_tensor(R[None]), s0, aa_index_of(m)).item()
 
     # 1) 非局部 pair (0,3) 压到 0.2 nm：只看排斥项的贡献（同一构型下把 σ 置 0 作对照）
     R1 = base.copy()
@@ -135,6 +140,7 @@ def test_save_load_roundtrip(toy_model_double, tmp_path):
     rng = np.random.default_rng(4)
     R = torch.as_tensor(rng.normal(0, 0.4, size=(2, 6, 3)))
     s = torch.as_tensor(rng.integers(0, 3, size=(2, 6)), dtype=torch.long)
-    assert torch.allclose(toy_model_double.energy(R, s), model2.energy(R, s),
+    a = aa_index_of(toy_model_double)
+    assert torch.allclose(toy_model_double.energy(R, s, a), model2.energy(R, s, a),
                           rtol=0, atol=0)
     assert model2._meta["system"] == "ala6"

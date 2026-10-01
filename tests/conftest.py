@@ -27,10 +27,21 @@ def randomize(model: torch.nn.Module, scale: float, seed: int = 0) -> torch.nn.M
     return model
 
 
+def aa_index_of(topo_or_model) -> torch.Tensor:
+    """取参考序列的运行时 a（(N,) long）。模型或拓扑皆可。"""
+    topo = getattr(topo_or_model, "topo", topo_or_model)
+    return torch.as_tensor(topo.aa_index, dtype=torch.long)
+
+
 @pytest.fixture
 def toy_topology() -> CGTopology:
     # "AAAAAA"：两性离子，4 个可动位点（首尾冻结）
     return CGTopology.from_sequence("AAAAAA")
+
+
+@pytest.fixture
+def toy_a(toy_topology) -> torch.Tensor:
+    return aa_index_of(toy_topology)
 
 
 @pytest.fixture

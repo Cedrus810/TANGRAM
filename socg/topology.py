@@ -12,7 +12,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .constants import AA_INDEX
+from .constants import AA_ALPHABET, AA_INDEX
 
 RES_CLASS_GLY = 0
 RES_CLASS_PRO = 1
@@ -29,9 +29,17 @@ def _res_class(letter: str) -> int:
     return RES_CLASS_OTHER
 
 
+# 氨基酸索引 -> 残基类别的固定查表（统一设计文档 §9：res_class 是 a 的运行时派生量）
+RES_CLASS_TABLE = np.asarray([_res_class(ch) for ch in AA_ALPHABET], dtype=np.int64)
+
+
 @dataclass(frozen=True)
 class CGTopology:
-    """一条序列的 Cα 拓扑。所有数组均为派生属性（property）。"""
+    """一条参考序列的 Cα 拓扑。所有数组均为派生属性（property）。
+
+    统一设计文档 §8 起，序列身份是运行时状态变量（见 socg.sequence.SequenceState）；
+    本类保留的 sequence 是构造时的参考序列（序列化与初值用），运行时 a 可与其不同。
+    """
 
     sequence: str
     frozen: tuple[bool, ...]
@@ -40,7 +48,7 @@ class CGTopology:
     # 构造
     # ------------------------------------------------------------------ #
     @classmethod
-    def from_sequence(cls, sequence: str, capped: bool = False) -> "CGTopology":
+    def from_sequence(cls, sequence: str, capped: bool = False) -> CGTopology:
         sequence = str(sequence)
         if len(sequence) < 4:
             raise ValueError(f"sequence too short (<4): {sequence!r}")
@@ -124,6 +132,6 @@ class CGTopology:
         return json.dumps({"sequence": self.sequence, "frozen": list(self.frozen)})
 
     @classmethod
-    def from_json(cls, s: str) -> "CGTopology":
+    def from_json(cls, s: str) -> CGTopology:
         d = json.loads(s)
         return cls(sequence=d["sequence"], frozen=tuple(bool(b) for b in d["frozen"]))

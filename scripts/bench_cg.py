@@ -50,7 +50,8 @@ def main() -> int:
                          seed=args.seed)
     sim = CGSimulator(model, cfg,
                       torch.as_tensor(batch, dtype=torch.float32, device=device),
-                      torch.zeros((args.replicas, args.n_res), dtype=torch.long))
+                      torch.zeros((args.replicas, args.n_res), dtype=torch.long),
+                      torch.as_tensor(topo.aa_index, dtype=torch.long, device=device))
     # 预热
     sim.run(min(50, args.steps))
     t0 = time.time()

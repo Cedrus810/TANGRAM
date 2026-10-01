@@ -1,12 +1,14 @@
 """混合 Langevin + Metropolis 态翻转 CG 模拟器（D1）。
 
-R 用 BAOAB 积分；每 flip_interval 步做一次 flip_sweep（M 次单点提议，
-M = 可动位点数，各 replica 独立）：位点在可动位点中均匀抽取，新态在另外
-K-1 个态中均匀抽取，接受概率 min(1, exp(-βΔU))。K=1 或 flip_interval=0
-时从不翻转。每步检查非有限值：默认 on_nonfinite="raise" 抛 RuntimeError（含
-步数与 replica 编号）；on_nonfinite="freeze" 时把出事的 replica 冻结在最后一个
-有限构型（不再积分、不再翻转），其余继续，并记录 exploded_mask / exploded_step，
-供生产模拟统计爆炸比例（T11：不许静默丢弃）。
+状态 X = (R, s, a)：R 用 BAOAB 积分；每 flip_interval 步做一次 flip_sweep
+（M 次单点提议，M = 可动位点数，各 replica 独立）：位点在可动位点中均匀抽取，
+新态在另外 K-1 个态中均匀抽取，接受概率 min(1, exp(-βΔU))。K=1 或
+flip_interval=0 时从不翻转。序列 a 是运行时状态变量（统一设计文档 §17），
+本阶段无序列移动（K_a 为恒等核，Phase 2 接入）。每步检查非有限值：默认
+on_nonfinite="raise" 抛 RuntimeError（含步数与 replica 编号）；
+on_nonfinite="freeze" 时把出事的 replica 冻结在最后一个有限构型（不再积分、
+不再翻转），其余继续，并记录 exploded_mask / exploded_step，供生产模拟统计
+爆炸比例（T11：不许静默丢弃）。
 """
 from __future__ import annotations
 
@@ -31,17 +33,18 @@ class LangevinConfig:
 
 
 class CGSimulator:
-    """批量 (B 个 replica) 混合动力学。"""
+    """批量 (B 个 replica) 混合动力学。状态 (R, s, a)。"""
 
     def __init__(self, model: SOCGModel, config: LangevinConfig,
-                 R0: torch.Tensor, s0: torch.Tensor, v0: torch.Tensor | None = None,
+                 R0: torch.Tensor, s0: torch.Tensor, a0: torch.Tensor,
+                 v0: torch.Tensor | None = None,
                  on_nonfinite: str = "raise"):
         if on_nonfinite not in ("raise", "freeze"):
             raise ValueError(f"on_nonfinite must be 'raise' or 'freeze', got {on_nonfinite!r}")
         self.model = model
         self.config = config
         self.on_nonfinite = on_nonfinite
-        device = model.res_class.device
+        device = model.w_bond.device
         dtype = model.w_bond.dtype
         self.R = R0.detach().to(device=device, dtype=dtype).clone()
         if self.R.ndim != 3:
@@ -51,6 +54,7 @@ class CGSimulator:
             torch.as_tensor(s0, dtype=torch.long, device=device)).clone()
         if self.s.shape != (self.B, self.N):
             raise ValueError(f"s0 shape {tuple(self.s.shape)} != {(self.B, self.N)}")
+        self.a = self._normalize_a0(a0, device)
         if v0 is None:
             self.v = torch.zeros_like(self.R)
         else:
@@ -79,17 +83,29 @@ class CGSimulator:
         self._records_R: list[torch.Tensor] = []
         self._records_s: list[torch.Tensor] = []
 
+    def _normalize_a0(self, a0: torch.Tensor, device) -> torch.Tensor:
+        """a0: (N,) 或 (B, N) long -> (B, N)（clone，Phase 2 起按 replica 突变）。"""
+        if not isinstance(a0, torch.Tensor):
+            a0 = torch.as_tensor(a0)
+        a0 = a0.to(device=device, dtype=torch.long)
+        if a0.dim() == 1:
+            a0 = a0.unsqueeze(0).expand(self.B, -1)
+        if a0.dim() != 2 or tuple(a0.shape) != (self.B, self.N):
+            raise ValueError(
+                f"a0 must be (N,) or (B,N) = ({self.B},{self.N}), got {tuple(a0.shape)}")
+        return a0.clone()
+
     # ------------------------------------------------------------------ #
     # 基础量
     # ------------------------------------------------------------------ #
     def _compute_forces(self) -> torch.Tensor:
         with torch.no_grad():
-            f = self.model.forces(self.R, self.s)
+            f = self.model.forces(self.R, self.s, self.a)
         return f
 
     def potential_energy(self) -> torch.Tensor:
         with torch.no_grad():
-            return self.model.energy(self.R, self.s)
+            return self.model.energy(self.R, self.s, self.a)
 
     def kinetic_energy(self) -> torch.Tensor:
         return 0.5 * self.mass * self.v.pow(2).sum(dim=(1, 2))
@@ -175,7 +191,7 @@ class CGSimulator:
             s_new = self.s.clone()
             s_new[rows, sites] = new_state
             with torch.no_grad():
-                U_new = self.model.energy(self.R, s_new)
+                U_new = self.model.energy(self.R, s_new, self.a)
             dU = U_new - self._U
             u = torch.rand(self.B, generator=self._rng, device=self.R.device)
             accept = torch.log(u) < -self.beta * dU
@@ -194,7 +210,7 @@ class CGSimulator:
 
     def _potential(self) -> torch.Tensor:
         with torch.no_grad():
-            return self.model.energy(self.R, self.s)
+            return self.model.energy(self.R, self.s, self.a)
 
     # ------------------------------------------------------------------ #
     # 记录与主循环

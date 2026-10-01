@@ -1,31 +1,36 @@
 """SOCG v0：operator-valued CG 势函数（能量函数在 Phase 1 文档 T8 中锁定）。
 
-U(R,s) = U_prior(R)
-       + Σ_bonds     RBF_bond(r_{i,i+1}) · w_bond
-       + Σ_angles    RBF_angle(θ_i) · w_angle[cls_i, s_i]          # 顶点 i
-       + Σ_dihedrals Fourier(τ) · w_dihed[s_j, s_k]                # 中心键 j-k
-       + Σ_i eps[cls_i, s_i]
-       + Σ_i w_nn[s_i, s_{i+1}]
-       + Σ_pairs     RBF_pair(r_ij) · sym(w_pair_state)[bucket_ij, s_i, s_j]
-       + Σ_{pairs, bucket=2} RBF_pair(r_ij) · sym(w_pair_type)[aa_i, aa_j]
+统一设计文档 §10 起，序列 a 是运行时状态变量：
+
+U(R,s,a) = U_prior(R)
+         + Σ_bonds     RBF_bond(r_{i,i+1}) · w_bond
+         + Σ_angles    RBF_angle(θ_i) · w_angle[c(a_i), s_i]        # 顶点 i
+         + Σ_dihedrals Fourier(τ) · w_dihed[s_j, s_k]              # 中心键 j-k
+         + Σ_i eps[c(a_i), s_i]
+         + Σ_i w_nn[s_i, s_{i+1}]
+         + Σ_pairs     RBF_pair(r_ij) · sym(w_pair_state)[bucket_ij, s_i, s_j]
+         + Σ_{pairs, bucket=2} RBF_pair(r_ij) · sym(w_pair_type)[a_i, a_j]
+
+其中 c(a) = RES_CLASS_TABLE[a] 为运行时查表（§9），模型不再持有序列缓冲；
+topo 里的 sequence 只是构造时的参考序列（序列化用），运行时 a 可以不同。
 
 所有可学习参数初始化为 0；模型对参数线性。角度在模型内部用弧度。
 """
 from __future__ import annotations
 
+import warnings
 from dataclasses import asdict, dataclass
 
 import numpy as np
 import torch
 from torch import nn
 
-from ..constants import AA_ALPHABET
 from ..states import FROZEN_STATE
-from ..topology import N_RES_CLASSES, N_SEP_BUCKETS, CGTopology
-from .basis import Fourier, RBF
+from ..topology import N_RES_CLASSES, N_SEP_BUCKETS, RES_CLASS_TABLE, CGTopology
+from .basis import RBF, Fourier
 from .priors import Priors
 
-N_AA = len(AA_ALPHABET)
+N_AA = len(RES_CLASS_TABLE)
 
 
 @dataclass(frozen=True)
@@ -55,7 +60,11 @@ def _torch_dihedral(p0, p1, p2, p3):
 
 
 class SOCGModel(nn.Module):
-    """带内部离散态的 Cα CG 模型。energy(R, s) 与 forces(R, s)。"""
+    """带内部离散态的 Cα CG 模型。energy(R, s, a) 与 forces(R, s, a)。
+
+    a 为运行时序列状态：(N,) 或 (B, N) long 张量；(N,) 按 batch 广播。
+    模型不持有序列缓冲，res_class 由 RES_CLASS_TABLE[a] 运行时派生。
+    """
 
     def __init__(self, topo: CGTopology, priors: Priors, config: ModelConfig):
         super().__init__()
@@ -89,8 +98,8 @@ class SOCGModel(nn.Module):
         self.register_buffer("pair_bucket", torch.as_tensor(topo.pair_bucket, dtype=torch.long))
         self.register_buffer("pair_type_rows",
                              torch.as_tensor(topo.pair_types_index, dtype=torch.long))
-        self.register_buffer("res_class", torch.as_tensor(topo.res_class, dtype=torch.long))
-        self.register_buffer("aa_index", torch.as_tensor(topo.aa_index, dtype=torch.long))
+        self.register_buffer("res_class_of_aa",
+                             torch.as_tensor(RES_CLASS_TABLE, dtype=torch.long))
         self.register_buffer("frozen_idx",
                              torch.as_tensor(np.where(topo.frozen_mask)[0], dtype=torch.long))
 
@@ -101,7 +110,7 @@ class SOCGModel(nn.Module):
         """K=1 时全置 0；K>1 时把冻结位点置为 FROZEN_STATE。"""
         if not isinstance(s, torch.Tensor):
             s = torch.as_tensor(s, dtype=torch.long)
-        s = s.to(device=self.res_class.device, dtype=torch.long)
+        s = s.to(device=self.w_bond.device, dtype=torch.long)
         if self.config.n_states == 1:
             return torch.zeros_like(s)
         s = s.clone()
@@ -109,31 +118,47 @@ class SOCGModel(nn.Module):
             s[..., self.frozen_idx] = FROZEN_STATE
         return s
 
+    def _normalize_a(self, R: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
+        """把 a 归一成与 R 同 batch 的 (B, N) long 张量。"""
+        if not isinstance(a, torch.Tensor):
+            a = torch.as_tensor(a)
+        a = a.to(device=R.device, dtype=torch.long)
+        if a.dim() == 1:
+            a = a.unsqueeze(0).expand(R.shape[0], -1)
+        if a.dim() != 2 or tuple(a.shape) != tuple(R.shape[:2]):
+            raise ValueError(
+                f"a must be (N,) or (B,N) matching R {tuple(R.shape[:2])}, "
+                f"got {tuple(a.shape)}")
+        return a
+
     # ------------------------------------------------------------------ #
     # 能量
     # ------------------------------------------------------------------ #
-    def energy(self, R: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
-        """R (B,N,3)、s (B,N) -> (B,)。冻结位点在内部被强制归位。"""
+    def energy(self, R: torch.Tensor, s: torch.Tensor,
+               a: torch.Tensor) -> torch.Tensor:
+        """R (B,N,3)、s (B,N)、a (N,) 或 (B,N) -> (B,)。冻结位点在内部被强制归位。"""
         dtype = self.w_bond.dtype
         R = R.to(dtype)
         s = self.prepare_states(s)
+        a = self._normalize_a(R, a)
         K = self.config.n_states
+        cls_all = self.res_class_of_aa[a]                                # (B,N)
 
         # bonds
         bi = self.bond_index
         d = torch.norm(R[:, bi[:, 0]] - R[:, bi[:, 1]], dim=-1)          # (B,nb)
         U = (self.bond_basis(d) * self.w_bond).sum(-1).sum(-1)
 
-        # angles（顶点 i：cls_i, s_i）
+        # angles（顶点 i：c(a_i), s_i）
         ai = self.angle_index                                            # (na,3)
         ba = R[:, ai[:, 0]] - R[:, ai[:, 1]]
         bc = R[:, ai[:, 2]] - R[:, ai[:, 1]]
         x = (ba * bc).sum(-1)
         y = torch.linalg.vector_norm(torch.cross(ba, bc, dim=-1), dim=-1)
         theta = torch.atan2(y, x)
-        cls_v = self.res_class[ai[:, 1]]                                 # (na,)
+        cls_v = cls_all[:, ai[:, 1]]                                     # (B,na)
         s_v = s[:, ai[:, 1]]                                             # (B,na)
-        w_a = self.w_angle.reshape(N_RES_CLASSES * K, -1)[cls_v[None, :] * K + s_v]
+        w_a = self.w_angle.reshape(N_RES_CLASSES * K, -1)[cls_v * K + s_v]
         U = U + (self.angle_basis(theta) * w_a).sum(-1).sum(-1)
 
         # dihedrals（中心键 j-k：s_j, s_k）
@@ -145,7 +170,7 @@ class SOCGModel(nn.Module):
         U = U + (self.dihedral_basis(tau) * w_d).sum(-1).sum(-1)
 
         # eps 与相邻态耦合
-        U = U + self.eps.reshape(-1)[self.res_class[None, :] * K + s].sum(-1)
+        U = U + self.eps.reshape(-1)[cls_all * K + s].sum(-1)
         U = U + self.w_nn.reshape(K * K)[s[:, :-1] * K + s[:, 1:]].sum(-1)
 
         # 非局部 pair（态依赖，对称化）
@@ -162,8 +187,7 @@ class SOCGModel(nn.Module):
             rows = self.pair_type_rows
             pr = pi[rows]                                                # (npt,2)
             dp2 = dp[:, rows]
-            aa = self.aa_index
-            idx2 = aa[pr[:, 0]][None, :] * N_AA + aa[pr[:, 1]][None, :]
+            idx2 = a[:, pr[:, 0]] * N_AA + a[:, pr[:, 1]]                # (B,npt)
             w_pt = 0.5 * (self.w_pair_type + self.w_pair_type.transpose(0, 1))
             U = U + (self.pair_basis(dp2)
                      * w_pt.reshape(N_AA * N_AA, -1)[idx2]).sum(-1).sum(-1)
@@ -173,7 +197,7 @@ class SOCGModel(nn.Module):
     # ------------------------------------------------------------------ #
     # 力
     # ------------------------------------------------------------------ #
-    def forces(self, R: torch.Tensor, s: torch.Tensor,
+    def forces(self, R: torch.Tensor, s: torch.Tensor, a: torch.Tensor,
                create_graph: bool = False) -> torch.Tensor:
         """等于 -∂U/∂R，(B,N,3)。
 
@@ -183,7 +207,7 @@ class SOCGModel(nn.Module):
         dtype = self.w_bond.dtype
         with torch.enable_grad():
             R = R.to(dtype).detach().clone().requires_grad_(True)
-            U = self.energy(R, s)
+            U = self.energy(R, s, a)
             grad = torch.autograd.grad(U.sum(), R, create_graph=create_graph)[0]
         if not create_graph:
             grad = grad.detach()
@@ -206,6 +230,10 @@ def save_model(path, model: SOCGModel, meta: dict | None = None) -> None:
     }, str(path))
 
 
+# v0 -> v1 兼容：这些键是新增的常量缓冲，旧 checkpoint 里没有，模型默认值即正确值
+_COMPAT_MISSING_OK = frozenset({"res_class_of_aa"})
+
+
 def load_model(path, map_location=None) -> SOCGModel:
     ckpt = torch.load(str(path), map_location=map_location, weights_only=False)
     topo = CGTopology.from_json(ckpt["topology_json"])
@@ -214,10 +242,23 @@ def load_model(path, map_location=None) -> SOCGModel:
     priors.load_state_dict(ckpt["priors_state"])
     model = SOCGModel(topo, priors, config)
     # load_state_dict 会按现有张量的 dtype 强转；先对齐成保存时的 dtype，保证往返逐位一致
-    state = ckpt["model_state"]
+    state = dict(ckpt["model_state"])
+    # v0 checkpoint 含 res_class/aa_index 序列缓冲（统一设计文档 §8 已移除）：
+    # 丢弃多余键，序列改为运行时传入
+    own = set(model.state_dict().keys())
+    dropped = sorted(k for k in state if k not in own)
+    if dropped:
+        warnings.warn(
+            f"checkpoint {path} contains legacy sequence buffers not in this "
+            f"model version, dropping: {dropped}; sequence is now a runtime "
+            f"argument (energy(R, s, a))", stacklevel=2)
+        state = {k: v for k, v in state.items() if k in own}
     for name, t in list(model.named_parameters()) + list(model.named_buffers()):
         if name in state and state[name].dtype != t.dtype:
             t.data = t.data.to(state[name].dtype)
-    model.load_state_dict(state)
+    result = model.load_state_dict(state, strict=False)
+    bad_missing = [k for k in result.missing_keys if k not in _COMPAT_MISSING_OK]
+    if bad_missing:
+        raise RuntimeError(f"checkpoint {path} is missing required keys: {bad_missing}")
     model._meta = dict(ckpt.get("meta", {}))
     return model

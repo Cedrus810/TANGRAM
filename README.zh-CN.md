@@ -2,8 +2,7 @@
 
 [English](README.md) | **简体中文**
 
-> **TANGRAM** —— Stateful-Operator Coarse-Graining for Proteins
-> （中文可称 **七巧**：少数几块固定形状的板，按通用规则拼出任意图形）
+> **TANGRAM** —— 面向蛋白质的 Stateful Operator Coarse Graining 方法
 
 少数可复用的 **residue operator primitives**（每个残基 = bead + 姿态 + 氨基酸种类 +
 离散内部态 *s*）与通用耦合规则，按"七巧板拼装"的方式构成多尺度动力学模型，
@@ -11,17 +10,6 @@
 
 动力学为连续坐标 Langevin（BAOAB）+ 离散内部态 Metropolis flip 的混合采样；
 势函数对参数线性（RBF / Fourier 基 + 查表权重），由力匹配 + 变分似然联合拟合凸目标。
-
-## 命名约定
-
-| 场景 | 名字 |
-|---|---|
-| 论文 / 对外 / 文档标题 | **TANGRAM** |
-| 中文 | 七巧 (qī qiǎo) |
-| 代码包名 / 目录 / import | `socg`（历史工作代号，保留不动） |
-
-历史文档中出现的 **SOCG**（Stateful Operator Coarse Graining）即本项目的早期代号，
-指向同一方法。
 
 ## 现状速览（2026-10-01）
 

@@ -2,8 +2,7 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-> **TANGRAM** — Stateful-Operator Coarse-Graining for Proteins
-> （中文名：**七巧**）
+> **TANGRAM** — a Stateful Operator Coarse Graining method for proteins
 
 Named after the tangram puzzle: a small set of fixed pieces — reusable **residue
 operator primitives** (each residue = bead + orientation + amino-acid type + a
@@ -15,17 +14,6 @@ The dynamics is hybrid sampling: Langevin (BAOAB) for the continuous coordinates
 and Metropolis flips for the discrete internal states. The potential is linear in
 its parameters (RBF / Fourier basis + tabulated weights), fitted jointly by force
 matching and a variational likelihood — a convex objective.
-
-## Naming
-
-| Context | Name |
-|---|---|
-| Paper / public / docs | **TANGRAM** |
-| Chinese | 七巧 (qī qiǎo) |
-| Package / directory / import | `socg` (historical working codename, kept) |
-
-**SOCG** (Stateful Operator Coarse Graining) in older material refers to the
-same project.
 
 ## Status (2026-10-01)
 

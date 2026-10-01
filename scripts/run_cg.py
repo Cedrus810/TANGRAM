@@ -34,6 +34,10 @@ def main() -> int:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--save-chunk-steps", type=int, default=0,
                         help=">0 时每推进这么多步写一个 part 文件（须为 record-interval 的倍数）")
+    parser.add_argument("--seq-interval", type=int, default=0,
+                        help=">0 时每推进这么多步做一次均匀提议的单位点序列突变（Phase 2 基线）")
+    parser.add_argument("--seq-update", default="full", choices=["full", "local"],
+                        help="序列移动 ΔU 路径：full=两次全能量，local=局部重算（§29.2）")
     args = parser.parse_args()
 
     import torch
@@ -56,13 +60,18 @@ def main() -> int:
 
     cfg = LangevinConfig(temperature=dataset.temperature, dt_ps=args.dt,
                          friction_per_ps=args.friction, flip_interval=args.flip_interval,
-                         record_interval=args.record_interval, seed=args.seed)
+                         record_interval=args.record_interval, seed=args.seed,
+                         seq_interval=args.seq_interval, seq_update=args.seq_update)
+    proposal = None
+    if args.seq_interval > 0:
+        from socg.sequence import UniformSequenceProposal
+        proposal = UniformSequenceProposal()
     sim = CGSimulator(model.to(device=device), cfg,
                       torch.as_tensor(R0, device=device),
                       torch.as_tensor(s0, device=device),
                       torch.as_tensor(model.topo.aa_index, dtype=torch.long,
                                       device=device),
-                      on_nonfinite="freeze")
+                      on_nonfinite="freeze", sequence_proposal=proposal)
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -77,7 +86,10 @@ def main() -> int:
             done += n
             part += 1
     else:
-        coords, states = sim.run(args.steps)
+        if args.seq_interval > 0:
+            coords, states, sequences = sim.run(args.steps, return_sequences=True)
+        else:
+            coords, states = sim.run(args.steps)
 
     exploded = sim.exploded_mask
     payload = {
@@ -98,10 +110,16 @@ def main() -> int:
     else:
         payload["coords"] = coords
         payload["states"] = states
+        if args.seq_interval > 0:
+            payload["sequences"] = sequences
+            payload["sequence_acceptance_rate"] = sim.sequence_acceptance_rate
     np.savez(out, **payload)
     n_bad = int(exploded.sum())
+    seq_note = (f" seq_accept={sim.sequence_acceptance_rate:.3f}"
+                if args.seq_interval > 0 else "")
     print(f"[run_cg] wrote {out}: replicas={args.replicas} steps={args.steps} "
-          f"acceptance={sim.acceptance_rate:.3f} exploded={n_bad}/{args.replicas}")
+          f"acceptance={sim.acceptance_rate:.3f}{seq_note} "
+          f"exploded={n_bad}/{args.replicas}")
     if n_bad:
         steps_bad = sim.exploded_step[exploded]
         print(f"[run_cg] WARNING: exploded replicas {np.flatnonzero(exploded).tolist()[:20]} "

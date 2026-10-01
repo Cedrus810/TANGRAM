@@ -1,14 +1,23 @@
-"""混合 Langevin + Metropolis 态翻转 CG 模拟器（D1）。
+"""混合 Langevin + Metropolis 态/序列翻转 CG 模拟器（D1；统一设计文档 §7/§17/§18）。
 
 状态 X = (R, s, a)：R 用 BAOAB 积分；每 flip_interval 步做一次 flip_sweep
 （M 次单点提议，M = 可动位点数，各 replica 独立）：位点在可动位点中均匀抽取，
 新态在另外 K-1 个态中均匀抽取，接受概率 min(1, exp(-βΔU))。K=1 或
-flip_interval=0 时从不翻转。序列 a 是运行时状态变量（统一设计文档 §17），
-本阶段无序列移动（K_a 为恒等核，Phase 2 接入）。每步检查非有限值：默认
-on_nonfinite="raise" 抛 RuntimeError（含步数与 replica 编号）；
-on_nonfinite="freeze" 时把出事的 replica 冻结在最后一个有限构型（不再积分、
-不再翻转），其余继续，并记录 exploded_mask / exploded_step，供生产模拟统计
-爆炸比例（T11：不许静默丢弃）。
+flip_interval=0 时从不翻转。
+
+序列移动（统一设计文档 §6/§13/§18）：每 seq_interval 步做一次
+sequence_flip_sweep——由 SequenceProposal 在可突变位点上提议 a_i'，按
+Metropolis–Hastings 接受：
+
+    A = min[1, exp(-βΔU) · q(a|R,a') / q(a'|R,a)]
+
+seq_update="full" 用两次全能量差分求 ΔU；"local" 用模型的局部 ΔU（§29.2，
+只重算依赖 a_i 的项）。无提议算子或 seq_interval=0 时 K_a 为恒等核。
+
+每步检查非有限值：默认 on_nonfinite="raise" 抛 RuntimeError（含步数与
+replica 编号）；on_nonfinite="freeze" 时把出事的 replica 冻结在最后一个
+有限构型（不再积分、不再翻转/突变），其余继续，并记录 exploded_mask /
+exploded_step，供生产模拟统计爆炸比例（T11：不许静默丢弃）。
 """
 from __future__ import annotations
 
@@ -19,6 +28,7 @@ import torch
 
 from .constants import KB
 from .model.socg import SOCGModel
+from .sequence.base import SequenceProposal
 
 
 @dataclass(frozen=True)
@@ -30,6 +40,8 @@ class LangevinConfig:
     flip_interval: int = 10     # 0 表示关闭翻转
     record_interval: int = 500
     seed: int = 0
+    seq_interval: int = 0       # 0 表示关闭序列移动
+    seq_update: str = "full"    # "full" | "local"（§29.2 局部 ΔU）
 
 
 class CGSimulator:
@@ -38,12 +50,20 @@ class CGSimulator:
     def __init__(self, model: SOCGModel, config: LangevinConfig,
                  R0: torch.Tensor, s0: torch.Tensor, a0: torch.Tensor,
                  v0: torch.Tensor | None = None,
-                 on_nonfinite: str = "raise"):
+                 on_nonfinite: str = "raise",
+                 sequence_proposal: SequenceProposal | None = None,
+                 mutable_mask: torch.Tensor | None = None):
         if on_nonfinite not in ("raise", "freeze"):
             raise ValueError(f"on_nonfinite must be 'raise' or 'freeze', got {on_nonfinite!r}")
+        if config.seq_update not in ("full", "local"):
+            raise ValueError(
+                f"seq_update must be 'full' or 'local', got {config.seq_update!r}")
+        if sequence_proposal is not None and config.seq_interval <= 0:
+            raise ValueError("sequence_proposal given but seq_interval <= 0")
         self.model = model
         self.config = config
         self.on_nonfinite = on_nonfinite
+        self.seq_proposal = sequence_proposal
         device = model.w_bond.device
         dtype = model.w_bond.dtype
         self.R = R0.detach().to(device=device, dtype=dtype).clone()
@@ -67,6 +87,16 @@ class CGSimulator:
         self.sigma_v = float(np.sqrt(KB * config.temperature / self.mass))
         self.movable = torch.as_tensor(
             np.where(~model.topo.frozen_mask)[0], dtype=torch.long, device=device)
+        # 序列可突变位点：外部 mutable_mask 优先，否则用拓扑内部残基（首尾除外）
+        if mutable_mask is not None:
+            m = torch.as_tensor(mutable_mask, dtype=torch.bool, device=device)
+            if m.dim() == 2 and m.shape[0] == 1:
+                m = m[0]
+            if tuple(m.shape) != (self.N,):
+                raise ValueError(f"mutable_mask must be (N,) = ({self.N},), got {tuple(m.shape)}")
+            self.seq_mutable = m.nonzero().squeeze(-1)
+        else:
+            self.seq_mutable = self.movable
         self.k = int(model.config.n_states)
 
         self.alive = torch.ones(self.B, dtype=torch.bool, device=device)
@@ -80,11 +110,14 @@ class CGSimulator:
         self._step_count = 0
         self.accepted = 0
         self.proposed = 0
+        self.seq_accepted = 0
+        self.seq_proposed = 0
         self._records_R: list[torch.Tensor] = []
         self._records_s: list[torch.Tensor] = []
+        self._records_a: list[torch.Tensor] = []
 
     def _normalize_a0(self, a0: torch.Tensor, device) -> torch.Tensor:
-        """a0: (N,) 或 (B, N) long -> (B, N)（clone，Phase 2 起按 replica 突变）。"""
+        """a0: (N,) 或 (B, N) long -> (B, N)（clone，序列移动按 replica 突变）。"""
         if not isinstance(a0, torch.Tensor):
             a0 = torch.as_tensor(a0)
         a0 = a0.to(device=device, dtype=torch.long)
@@ -117,6 +150,11 @@ class CGSimulator:
     @property
     def acceptance_rate(self) -> float:
         return float(self.accepted) / float(self.proposed) if self.proposed else 0.0
+
+    @property
+    def sequence_acceptance_rate(self) -> float:
+        return (float(self.seq_accepted) / float(self.seq_proposed)
+                if self.seq_proposed else 0.0)
 
     # ------------------------------------------------------------------ #
     # 积分
@@ -208,6 +246,57 @@ class CGSimulator:
             self._forces[~self.alive] = 0.0
         self._U = self._potential()
 
+    # ------------------------------------------------------------------ #
+    # Metropolis–Hastings 序列移动（统一设计文档 §6/§18）
+    # ------------------------------------------------------------------ #
+    def sequence_flip_sweep(self) -> None:
+        """每个 replica 一次单位点突变提议 + MH 接受。
+
+        提议由 self.seq_proposal 给出；log_q(R, a_from, a_to, site) 分别在
+        (a→a') 与 (a'→a) 上求值得到 Hastings 修正。ΔU 用 full（两次全能量）
+        或 local（只重算 a 依赖项，§29.2）路径。
+        """
+        if self.seq_proposal is None or self.config.seq_interval <= 0:
+            return
+        self._U = self._potential()      # 刷新基准能量（R 已移动）
+        M = int(self.seq_mutable.numel())
+        if M == 0:
+            return
+        rows = torch.arange(self.B, device=self.R.device)
+        site_col = torch.randint(0, M, (self.B,), generator=self._rng,
+                                 device=self.R.device)
+        sites = self.seq_mutable[site_col]
+        with torch.no_grad():
+            new_aa = self.seq_proposal.sample(self.R, self.a, sites,
+                                              generator=self._rng)
+            if self.config.seq_update == "local":
+                dU = self.model.mutation_delta_u_local(self.R, self.s, self.a,
+                                                       sites, new_aa)
+            else:
+                a_new = self.a.clone()
+                a_new[rows, sites] = new_aa
+                dU = (self.model.energy(self.R, self.s, a_new)
+                      - self.model.energy(self.R, self.s, self.a))
+            # Hastings：log q(a'→a) - log q(a→a')（同一 R；同一被突变位点）
+            a_new = self.a.clone()
+            a_new[rows, sites] = new_aa
+            log_q_forward = self.seq_proposal.log_q(self.R, self.a, a_new, sites)
+            log_q_reverse = self.seq_proposal.log_q(self.R, a_new, self.a, sites)
+            log_accept = -self.beta * dU + log_q_reverse - log_q_forward
+            u = torch.rand(self.B, generator=self._rng, device=self.R.device)
+            accept = torch.log(u) < log_accept
+            accept &= torch.isfinite(dU) & self.alive
+            self.seq_proposed += self.B
+            self.seq_accepted += int(accept.sum())
+            if bool(accept.any()):
+                idx = accept.nonzero().squeeze(-1)
+                self.a[idx, sites[idx]] = new_aa[idx]
+        # 序列变化改变能量 -> 重算力与能量
+        self._forces = self._compute_forces()
+        if not bool(self.alive.all()):
+            self._forces[~self.alive] = 0.0
+        self._U = self._potential()
+
     def _potential(self) -> torch.Tensor:
         with torch.no_grad():
             return self.model.energy(self.R, self.s, self.a)
@@ -218,9 +307,12 @@ class CGSimulator:
     def _record_frame(self) -> None:
         self._records_R.append(self.R.detach().to(torch.float32).cpu().clone())
         self._records_s.append(self.s.detach().to(torch.int8).cpu().clone())
+        self._records_a.append(self.a.detach().to(torch.int8).cpu().clone())
 
-    def run(self, n_steps: int, record_initial: bool = True) -> tuple[np.ndarray, np.ndarray]:
-        """推进 n_steps，返回 (coords (B,T,N,3) f32, states (B,T,N) int8)。
+    def run(self, n_steps: int, record_initial: bool = True,
+            return_sequences: bool = False):
+        """推进 n_steps，返回 (coords (B,T,N,3) f32, states (B,T,N) int8)；
+        return_sequences=True 时追加序列轨迹 (B,T,N) int8 作第三返回值。
 
         record_initial=True 时先记录当前帧；之后在全局步数为 r 的倍数时追加。
         从 0 步起调用时 T = n_steps//r + 1。分段调用时，后续段传
@@ -234,13 +326,23 @@ class CGSimulator:
                     and self._step_count % self.config.flip_interval == 0
                     and self._step_count > 0):
                 self.flip_sweep()
+            if (self.seq_proposal is not None
+                    and self._step_count % self.config.seq_interval == 0
+                    and self._step_count > 0):
+                self.sequence_flip_sweep()
             self._step()
             if self._step_count % r == 0:
                 self._record_frame()
         if not self._records_R:
-            return (np.zeros((self.B, 0, self.N, 3), np.float32),
-                    np.zeros((self.B, 0, self.N), np.int8))
+            coords = np.zeros((self.B, 0, self.N, 3), np.float32)
+            states = np.zeros((self.B, 0, self.N), np.int8)
+            if return_sequences:
+                return coords, states, np.zeros((self.B, 0, self.N), np.int8)
+            return coords, states
         coords = torch.stack(self._records_R, dim=1).numpy()
         states = torch.stack(self._records_s, dim=1).numpy()
-        self._records_R, self._records_s = [], []
+        seqs = torch.stack(self._records_a, dim=1).numpy()
+        self._records_R, self._records_s, self._records_a = [], [], []
+        if return_sequences:
+            return coords, states, seqs
         return coords, states

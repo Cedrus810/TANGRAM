@@ -1,16 +1,11 @@
-"""序列状态与序列提议算子接口（统一设计文档 §8/§15/§17）。
+"""序列状态容器与提议算子抽象接口（统一设计文档 §8/§15/§17）。
 
 序列身份 a 从拓扑元数据提升为运行时状态变量：X = (R, s, a)。本模块提供
+SequenceState（a 的运行时容器）与 SequenceProposal（序列空间提议算子抽象
+接口 q(a' | R, a)）。能量模型与模拟器只依赖该接口，不依赖具体提议模型。
 
-- SequenceState：a 的运行时容器（aa_index + mutable_mask）；
-- SequenceProposal：序列空间提议算子抽象接口 q(a' | R, a)。能量模型与
-  模拟器只依赖该接口，不依赖具体提议模型（ProteinMPNN 适配器 Phase 3 接入）；
-- UniformSequenceProposal：单位点均匀提议（Phase 2 序列 MC 的最简提议，
-  兼作 MH 机器的验证基线）。
-
-Metropolis–Hastings 接受概率（设计文档 §6）：
-    A = min[1, exp(-β ΔU) · q(a|R,a') / q(a'|R,a)]
-均匀单位点提议的前后比值恒为 1（log_q_ratio = 0）。
+Metropolis-Hastings 接受概率（设计文档 §6）：
+    A = min[1, exp(-β ΔU) * q(a|R,a') / q(a'|R,a)]
 """
 from __future__ import annotations
 
@@ -18,7 +13,7 @@ from dataclasses import dataclass
 
 import torch
 
-from .topology import CGTopology
+from ..topology import CGTopology
 
 
 @dataclass
@@ -94,39 +89,3 @@ class SequenceProposal:
               site: torch.Tensor) -> torch.Tensor:
         """log q(a_to | R, a_from) 在位点 site，(B,)。前后调用共享同一 R。"""
         raise NotImplementedError
-
-
-class UniformSequenceProposal(SequenceProposal):
-    """单位点均匀提议：a_i' 从除当前值外的 N_AA-1 种氨基酸均匀抽取。
-
-    Phase 2 序列 MC 的基线提议：不依赖任何学习模型，前后概率恒等
-    （log_q_ratio = 0），专门用于验证 MH 机器本身的正确性。
-    """
-
-    def logits(self, R: torch.Tensor, a: torch.Tensor,
-               mutable_mask: torch.Tensor | None = None) -> torch.Tensor:
-        n_aa = int(a.max()) + 1 if a.numel() else 0
-        n_aa = max(n_aa, 20)
-        out = torch.zeros(*a.shape, n_aa, device=a.device, dtype=R.dtype)
-        if mutable_mask is not None:
-            out = out.masked_fill(~mutable_mask.unsqueeze(-1), float("-inf"))
-        return out
-
-    def sample(self, R: torch.Tensor, a: torch.Tensor, site: torch.Tensor,
-               generator: torch.Generator | None = None) -> torch.Tensor:
-        old = a[torch.arange(a.shape[0], device=a.device), site]
-        n_aa = max(int(a.max()) + 1, 20)
-        # 拒绝采样：重抽与当前相同的索引（N_AA=20 时期望 20/19 ≈ 1.05 次）
-        cand = torch.randint(0, n_aa, old.shape, generator=generator, device=a.device)
-        redo = cand == old
-        while bool(redo.any()):
-            cand[redo] = torch.randint(0, n_aa, (int(redo.sum()),),
-                                       generator=generator, device=a.device)
-            redo = cand == old
-        return cand
-
-    def log_q(self, R: torch.Tensor, a_from: torch.Tensor, a_to: torch.Tensor,
-              site: torch.Tensor) -> torch.Tensor:
-        n_aa = max(int(a_from.max()) + 1, int(a_to.max()) + 1, 20)
-        return torch.full(site.shape, -float(torch.log(torch.tensor(float(n_aa - 1)))),
-                          device=a_from.device)

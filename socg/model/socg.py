@@ -103,6 +103,37 @@ class SOCGModel(nn.Module):
         self.register_buffer("frozen_idx",
                              torch.as_tensor(np.where(topo.frozen_mask)[0], dtype=torch.long))
 
+        # ---- 突变能量学索引（非持久化：仅拓扑派生，不进 state_dict）---- #
+        # 顶点 i 的角度行号（首尾残基无角度，-1）
+        vertex_angle = np.full(topo.n, -1, dtype=np.int64)
+        for row, (_i0, i1, _i2) in enumerate(topo.angles):
+            vertex_angle[i1] = row
+        self.register_buffer("vertex_angle_index",
+                             torch.as_tensor(vertex_angle, dtype=torch.long),
+                             persistent=False)
+        # 每个残基在 bucket==2 类型对中的伙伴与对应 pair 行号（补齐 -1 到等长）
+        pt_rows = topo.pair_types_index
+        pr = topo.pairs[pt_rows]
+        partners: list[list[int]] = [[] for _ in range(topo.n)]
+        prow: list[list[int]] = [[] for _ in range(topo.n)]
+        for row, (i, j) in enumerate(pr):
+            partners[i].append(int(j))
+            prow[i].append(int(pt_rows[row]))
+            partners[j].append(int(i))
+            prow[j].append(int(pt_rows[row]))
+        pmax = max((len(p) for p in partners), default=0) or 1
+        pt_partners = np.full((topo.n, pmax), -1, dtype=np.int64)
+        pt_pair_row = np.zeros((topo.n, pmax), dtype=np.int64)
+        for i in range(topo.n):
+            pt_partners[i, :len(partners[i])] = partners[i]
+            pt_pair_row[i, :len(prow[i])] = prow[i]
+        self.register_buffer("pt_partners",
+                             torch.as_tensor(pt_partners, dtype=torch.long),
+                             persistent=False)
+        self.register_buffer("pt_pair_row",
+                             torch.as_tensor(pt_pair_row, dtype=torch.long),
+                             persistent=False)
+
     # ------------------------------------------------------------------ #
     # 状态处理
     # ------------------------------------------------------------------ #
@@ -193,6 +224,186 @@ class SOCGModel(nn.Module):
                      * w_pt.reshape(N_AA * N_AA, -1)[idx2]).sum(-1).sum(-1)
 
         return U + self.priors(R)
+
+    # ------------------------------------------------------------------ #
+    # 能量分项（统一设计文档 §10：U = U_geom + U_conf + U_chem + ...）
+    # ------------------------------------------------------------------ #
+    def energy_terms(self, R: torch.Tensor, s: torch.Tensor,
+                     a: torch.Tensor) -> dict[str, torch.Tensor]:
+        """把能量分解为各项（每项 (B,)）；sum(terms) 与 energy() 数学恒等
+        （求和路径不同，浮点意义下允许 ~1e-12 相对差）。"""
+        dtype = self.w_bond.dtype
+        R = R.to(dtype)
+        s = self.prepare_states(s)
+        a = self._normalize_a(R, a)
+        K = self.config.n_states
+        cls_all = self.res_class_of_aa[a]
+
+        bi = self.bond_index
+        d = torch.norm(R[:, bi[:, 0]] - R[:, bi[:, 1]], dim=-1)
+        terms = {"bond": (self.bond_basis(d) * self.w_bond).sum(-1).sum(-1)}
+
+        ai = self.angle_index
+        ba = R[:, ai[:, 0]] - R[:, ai[:, 1]]
+        bc = R[:, ai[:, 2]] - R[:, ai[:, 1]]
+        theta = torch.atan2(torch.linalg.vector_norm(torch.cross(ba, bc, dim=-1), dim=-1),
+                            (ba * bc).sum(-1))
+        w_a = self.w_angle.reshape(N_RES_CLASSES * K, -1)[cls_all[:, ai[:, 1]] * K
+                                                         + s[:, ai[:, 1]]]
+        terms["angle"] = (self.angle_basis(theta) * w_a).sum(-1).sum(-1)
+
+        di = self.dihedral_index
+        tau = _torch_dihedral(R[:, di[:, 0]], R[:, di[:, 1]],
+                              R[:, di[:, 2]], R[:, di[:, 3]])
+        w_d = self.w_dihed.reshape(K * K, -1)[s[:, di[:, 1]] * K + s[:, di[:, 2]]]
+        terms["dihedral"] = (self.dihedral_basis(tau) * w_d).sum(-1).sum(-1)
+
+        terms["eps"] = self.eps.reshape(-1)[cls_all * K + s].sum(-1)
+        terms["w_nn"] = self.w_nn.reshape(K * K)[s[:, :-1] * K + s[:, 1:]].sum(-1)
+
+        pi = self.pair_index
+        dp = torch.norm(R[:, pi[:, 0]] - R[:, pi[:, 1]], dim=-1)
+        w_ps = 0.5 * (self.w_pair_state + self.w_pair_state.transpose(1, 2))
+        idx = (self.pair_bucket[None, :] * K * K + s[:, pi[:, 0]] * K + s[:, pi[:, 1]])
+        terms["pair_state"] = (self.pair_basis(dp)
+                               * w_ps.reshape(-1, dp.shape[-1])[idx]).sum(-1).sum(-1)
+
+        if self.w_pair_type is not None and self.pair_type_rows.numel():
+            rows = self.pair_type_rows
+            idx2 = a[:, pi[rows][:, 0]] * N_AA + a[:, pi[rows][:, 1]]
+            w_pt = 0.5 * (self.w_pair_type + self.w_pair_type.transpose(0, 1))
+            terms["pair_type"] = (self.pair_basis(dp[:, rows])
+                                  * w_pt.reshape(N_AA * N_AA, -1)[idx2]).sum(-1).sum(-1)
+        else:
+            terms["pair_type"] = torch.zeros_like(terms["bond"])
+
+        terms["prior"] = self.priors(R).to(terms["bond"].dtype)
+        return terms
+
+    # ------------------------------------------------------------------ #
+    # 突变能量学（统一设计文档 §29.2/§29.3）
+    # ------------------------------------------------------------------ #
+    def _site_theta(self, R: torch.Tensor, site: torch.Tensor) -> torch.Tensor:
+        """顶点为 site 的键角（每 replica 一项；首尾无角度处为 0），(B,)。"""
+        B = R.shape[0]
+        rows = self.vertex_angle_index[site]
+        valid = rows >= 0
+        tri = self.angle_index[rows.clamp_min(0)]                    # (B,3)
+        ba = R[torch.arange(B, device=R.device), tri[:, 0]] - R[
+            torch.arange(B, device=R.device), tri[:, 1]]
+        bc = R[torch.arange(B, device=R.device), tri[:, 2]] - R[
+            torch.arange(B, device=R.device), tri[:, 1]]
+        theta = torch.atan2(torch.linalg.vector_norm(torch.cross(ba, bc, dim=-1), dim=-1),
+                            (ba * bc).sum(-1))
+        return torch.where(valid, theta, torch.zeros_like(theta))
+
+    def _site_pair_basis(self, R: torch.Tensor, site: torch.Tensor) -> torch.Tensor:
+        """site 类型对伙伴距离的 RBF 基：(B, Pmax, n_rbf)（无伙伴处为 0）。"""
+        B = R.shape[0]
+        prow = self.pt_pair_row[site]                                # (B,Pmax)
+        pi = self.pair_index
+        dp = torch.norm(R[:, pi[:, 0]] - R[:, pi[:, 1]], dim=-1)     # (B,np)
+        basis = self.pair_basis(dp[torch.arange(B, device=R.device)[:, None], prow])
+        return basis * (self.pt_partners[site] >= 0)[:, :, None].to(basis.dtype)
+
+    def mutation_delta_u_all_aa(self, R: torch.Tensor, s: torch.Tensor,
+                                a: torch.Tensor, site: torch.Tensor) -> torch.Tensor:
+        """位点 site 上 20 种替换的精确 ΔU（只重算 a 依赖项），(B, N_AA)。
+
+        替换为当前氨基酸的列恒为 0（同 gather 逐位相消）。§29.3 批量打分。
+        """
+        B = R.shape[0]
+        site = site.to(device=R.device, dtype=torch.long)
+        a = self._normalize_a(R, a)
+        s = self.prepare_states(s)
+        K = self.config.n_states
+        cls_c = self.res_class_of_aa                                 # (20,)
+        aa_site = a[torch.arange(B, device=R.device), site]          # (B,)
+        s_site = s[torch.arange(B, device=R.device), site]           # (B,)
+        cls_old = self.res_class_of_aa[aa_site]
+
+        # 角度（顶点 = site）
+        theta = self._site_theta(R, site)                            # (B,)
+        basis_t = self.angle_basis(theta)                            # (B,nrbf)
+        w_new = self.w_angle.reshape(N_RES_CLASSES * K, -1)[
+            cls_c[None, :] * K + s_site[:, None]]                    # (B,20,nrbf)
+        w_old = self.w_angle.reshape(N_RES_CLASSES * K, -1)[
+            cls_old * K + s_site]                                    # (B,nrbf)
+        d_angle = (basis_t[:, None, :] * (w_new - w_old[:, None, :])).sum(-1)
+
+        # eps（onsite）
+        eps_flat = self.eps.reshape(-1)
+        d_eps = eps_flat[cls_c[None, :] * K + s_site[:, None]] \
+            - eps_flat[cls_old * K + s_site][:, None]
+
+        # 类型对（bucket==2，涉及 site 的伙伴）
+        basis_p = self._site_pair_basis(R, site)                     # (B,Pmax,nrbf)
+        partner = self.pt_partners[site].clamp_min(0)                # (B,Pmax)
+        aa_p = a[torch.arange(B, device=R.device)[:, None], partner]  # (B,Pmax)
+        if self.w_pair_type is not None:
+            w_pt = 0.5 * (self.w_pair_type + self.w_pair_type.transpose(0, 1))
+            w_flat = w_pt.reshape(N_AA * N_AA, -1)
+            idx_new = cls_c[None, :, None] * N_AA + aa_p[:, None, :]  # (B,20,Pmax)
+            idx_old = (aa_site * N_AA + aa_p)[:, None, :]             # (B,1,Pmax)
+            d_pair = (basis_p[:, None, :, :]
+                      * (w_flat[idx_new] - w_flat[idx_old])).sum(-1).sum(-1)
+        else:
+            d_pair = torch.zeros_like(d_angle)
+
+        return d_angle + d_eps + d_pair
+
+    def mutation_delta_u_local(self, R: torch.Tensor, s: torch.Tensor,
+                               a: torch.Tensor, site: torch.Tensor,
+                               aa_new: torch.Tensor) -> torch.Tensor:
+        """单位点精确 ΔU 的局部路径（§29.2）：每 replica 一个新氨基酸，(B,)。
+
+        与全能量差分 mutation_delta_u_full 数学恒等（浮点路径不同）。
+        """
+        B = R.shape[0]
+        site = site.to(device=R.device, dtype=torch.long)
+        aa_new = aa_new.to(device=R.device, dtype=torch.long)
+        K = self.config.n_states
+        a = self._normalize_a(R, a)
+        s = self.prepare_states(s)
+        ar = torch.arange(B, device=R.device)
+        aa_old = a[ar, site]
+        cls_new = self.res_class_of_aa[aa_new]
+        cls_old = self.res_class_of_aa[aa_old]
+        s_site = s[ar, site]
+
+        theta = self._site_theta(R, site)
+        w_flat = self.w_angle.reshape(N_RES_CLASSES * K, -1)
+        d_angle = ((self.angle_basis(theta)
+                    * (w_flat[cls_new * K + s_site] - w_flat[cls_old * K + s_site]))
+                   .sum(-1))
+        eps_flat = self.eps.reshape(-1)
+        d_eps = eps_flat[cls_new * K + s_site] - eps_flat[cls_old * K + s_site]
+
+        basis_p = self._site_pair_basis(R, site)
+        partner = self.pt_partners[site].clamp_min(0)
+        aa_p = a[ar[:, None], partner]
+        if self.w_pair_type is not None:
+            w_pt = 0.5 * (self.w_pair_type + self.w_pair_type.transpose(0, 1))
+            w_flat2 = w_pt.reshape(N_AA * N_AA, -1)
+            d_pair = (basis_p * (w_flat2[aa_new[:, None] * N_AA + aa_p]
+                                 - w_flat2[aa_old[:, None] * N_AA + aa_p])
+                      ).sum(-1).sum(-1)
+        else:
+            d_pair = torch.zeros_like(d_angle)
+        return d_angle + d_eps + d_pair
+
+    def mutation_delta_u_full(self, R: torch.Tensor, s: torch.Tensor,
+                              a: torch.Tensor, site: torch.Tensor,
+                              aa_new: torch.Tensor) -> torch.Tensor:
+        """全能量差分参考实现（慢路径，供测试/校验）：U(R,s,a') - U(R,s,a)。"""
+        B = R.shape[0]
+        a = self._normalize_a(R, a)
+        site = site.to(device=R.device, dtype=torch.long)
+        aa_new = aa_new.to(device=R.device, dtype=torch.long)
+        ar = torch.arange(B, device=R.device)
+        a_new = a.clone()
+        a_new[ar, site] = aa_new
+        return self.energy(R, s, a_new) - self.energy(R, s, a)
 
     # ------------------------------------------------------------------ #
     # 力

@@ -1,0 +1,20 @@
+# 大数据与产物不进 git（roadmap 约定：data/ models/ 不进）
+data/
+models/
+reports/
+smoke_r1/
+figures/
+
+# 内部设计 / 施工文档不进公开仓库
+DELIVERY.md
+docs/
+stateful_operator_coarse_graining_protein.md
+acs.jctc.6c01182.md
+
+# Python / 工具缓存
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+.ipynb_checkpoints/
